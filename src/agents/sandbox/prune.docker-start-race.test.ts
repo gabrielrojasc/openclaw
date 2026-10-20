@@ -121,7 +121,7 @@ afterEach(() => {
 
 async function withIdleContainer(
   prune: { idleHours: number; maxAgeDays: number },
-  options: { setupCommand?: string; createdAtMs?: number },
+  options: { setupCommand?: string; workspaceSource?: "managed-worktree"; createdAtMs?: number },
   run: (
     params: Parameters<typeof import("./docker.js").ensureSandboxContainer>[0],
   ) => Promise<void>,
@@ -138,6 +138,7 @@ async function withIdleContainer(
       engine: sandbox.docker.DOCKER_SANDBOX_ENGINE,
       scopeKey: "agent:main:main",
       workspaceDir: state.workspaceDir,
+      workspaceSource: options.workspaceSource,
       agentWorkspaceDir: state.workspaceDir,
       cfg: sandbox.config.resolveSandboxConfigForAgent(config, "main"),
     };
@@ -243,45 +244,55 @@ describe("sandbox prune and Docker container start", () => {
     );
   });
 
-  it("keeps an expired setup container that a run recreates while cleanup scans it", async () => {
-    const prune = { idleHours: 1, maxAgeDays: 1 };
-    await withIdleContainer(
-      prune,
-      { setupCommand: "echo ready", createdAtMs: Date.now() - 2 * 24 * HOUR_MS },
-      async (params) => {
-        docker.container!.hash = "stale-config";
-        const setupEntered = createDeferred();
-        const releaseSetup = createDeferred();
-        docker.beforeSetup = async () => {
-          setupEntered.resolve();
-          await releaseSetup.promise;
-        };
-        const scanned = createDeferred();
-        docker.afterScan = scanned.resolve;
+  it.each([
+    { kind: "setup", options: { setupCommand: "echo ready" }, pause: "beforeSetup" },
+    {
+      kind: "managed-worktree",
+      options: { workspaceSource: "managed-worktree" },
+      pause: "beforeStart",
+    },
+  ] as const)(
+    "keeps an expired $kind container that a run recreates while cleanup scans it",
+    async ({ options, pause }) => {
+      const prune = { idleHours: 1, maxAgeDays: 1 };
+      await withIdleContainer(
+        prune,
+        { ...options, createdAtMs: Date.now() - 2 * 24 * HOUR_MS },
+        async (params) => {
+          docker.container!.hash = "stale-config";
+          const paused = createDeferred();
+          const release = createDeferred();
+          docker[pause] = async () => {
+            paused.resolve();
+            await release.promise;
+          };
+          const scanned = createDeferred();
+          docker.afterScan = scanned.resolve;
 
-        const startedAtMs = Date.now();
-        const starting = sandbox.docker.ensureSandboxContainer(params);
-        await awaitGateBeforeSettlement(
-          setupEntered.promise,
-          starting,
-          "The run settled without setting up its replacement container",
-        );
-        const pruning = sandbox.prune.maybePruneSandboxes({
-          agents: { defaults: { sandbox: { mode: "all", prune } } },
-        });
-        await awaitGateBeforeSettlement(
-          scanned.promise,
-          pruning,
-          "Cleanup settled without scanning the registry",
-        );
-        const now = Date.now.bind(Date);
-        vi.spyOn(Date, "now").mockImplementation(() => now() + 1000);
-        releaseSetup.resolve();
-        const [started] = await Promise.all([starting, pruning]);
+          const startedAtMs = Date.now();
+          const starting = sandbox.docker.ensureSandboxContainer(params);
+          await awaitGateBeforeSettlement(
+            paused.promise,
+            starting,
+            "The run settled without reaching its paused container step",
+          );
+          const pruning = sandbox.prune.maybePruneSandboxes({
+            agents: { defaults: { sandbox: { mode: "all", prune } } },
+          });
+          await awaitGateBeforeSettlement(
+            scanned.promise,
+            pruning,
+            "Cleanup settled without scanning the registry",
+          );
+          const now = Date.now.bind(Date);
+          vi.spyOn(Date, "now").mockImplementation(() => now() + 1000);
+          release.resolve();
+          const [started] = await Promise.all([starting, pruning]);
 
-        expect(docker.created, "the run replaced the stale container").toBe(2);
-        await expectStartedContainerKept(started, startedAtMs);
-      },
-    );
-  });
+          expect(docker.created, "the run replaced the stale container").toBe(2);
+          await expectStartedContainerKept(started, startedAtMs);
+        },
+      );
+    },
+  );
 });
