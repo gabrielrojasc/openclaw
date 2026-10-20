@@ -42,6 +42,7 @@ import {
   readRegistryEntry,
   removeRegistryEntry,
   updateRegistry,
+  withSandboxRegistryEntryLock,
 } from "./registry.js";
 import {
   resolveDockerEnvPolicyEpoch,
@@ -306,11 +307,13 @@ export async function ensureSandboxContainer(params: EnsureSandboxContainerParam
     params.operatorAuthority?.assertCurrent();
     params.assertCurrent?.();
   };
-  return await withSandboxContainerLifecycle(
-    containerName,
-    params.cfg.scope === "shared" ? undefined : params.operatorAuthority,
-    (source) =>
-      ensureSandboxContainerLifecycle({ ...params, assertCurrent }, containerName, source),
+  return await withSandboxRegistryEntryLock({ containerName }, () =>
+    withSandboxContainerLifecycle(
+      containerName,
+      params.cfg.scope === "shared" ? undefined : params.operatorAuthority,
+      (source) =>
+        ensureSandboxContainerLifecycle({ ...params, assertCurrent }, containerName, source),
+    ),
   );
 }
 
@@ -552,10 +555,11 @@ async function ensureSandboxContainerLifecycle(
         );
       }
       params.assertCurrent?.();
+      const usedEntry = { ...readyEntry, lastUsedAtMs: Date.now() };
       if (needsSetupReservation) {
-        await completeSandboxRegistryReservation(readyEntry);
-      } else if (params.workspaceSource !== "managed-worktree") {
-        await updateRegistry(readyEntry);
+        await completeSandboxRegistryReservation(usedEntry);
+      } else {
+        await updateRegistry(usedEntry);
       }
       params.assertCurrent?.();
       return { containerName, containerId };
